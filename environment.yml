@@ -1,0 +1,19 @@
+name: eosc454-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - discretize
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - geopandas
+  - rasterio
+  - shapely
+  - jupyter
+  - ipykernel
+  - scikit-learn
+  - pip
+  - pip:
+      - simpeg
