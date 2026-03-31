@@ -111,11 +111,12 @@ def load_gxf(filepath: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, 
     if values.size > expected:
         values = values[:expected]
 
-    data = values.reshape((n_rows, n_cols))
+    # Ensure the reshaped grid is writable (some pandas/NumPy views are read-only).
+    data = np.array(values.reshape((n_rows, n_cols)), dtype=float, copy=True)
 
     nodata = metadata.get("nodata", None)
     if nodata is not None and np.isfinite(float(nodata)):
-        data = data.astype(float, copy=False)
+        data = data.astype(float, copy=True)
         data[data == float(nodata)] = np.nan
 
     x0 = float(metadata.get("x_origin", 0.0))
