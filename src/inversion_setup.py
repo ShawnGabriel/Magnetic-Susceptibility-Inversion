@@ -16,38 +16,23 @@ from simpeg import maps
 from simpeg.potential_fields import magnetics
 
 
+def _geometric_padding_widths(d_core: float, n_pad: int, factor: float) -> np.ndarray:
+    """``n_pad`` widths: first cell touching core is ``d_core * factor``, then ×factor."""
+    w0 = float(d_core) * float(factor)
+    return np.array([w0 * (factor**i) for i in range(int(n_pad))], dtype=float)
+
+
 def build_mesh(
     x: np.ndarray,
     y: np.ndarray,
-    core_cell_size: float = 100.0,
-    padding_cells: int = 8,
+    core_cell_size_xy: float = 500.0,
+    core_cell_size_z: float = 250.0,
+    depth_core_m: float = 5000.0,
+    padding_cells: int = 6,
     padding_factor: float = 1.5,
+    max_total_cells: int = 2_000_000,
 ) -> discretize.TensorMesh:
-    """Build a 3D TensorMesh around the survey area.
-
-    Parameters
-    ----------
-    x, y : np.ndarray
-        1D survey coordinate vectors.
-    core_cell_size : float, default=100.0
-        Core cell width in meters (x, y, and z).
-    padding_cells : int, default=8
-        Number of expanding padding cells added on each side.
-    padding_factor : float, default=1.5
-        Geometric growth factor for padding cells.
-
-    Returns
-    -------
-    discretize.TensorMesh
-        3D tensor mesh centered on survey area with x/y/z padding.
-
-    Notes
-    -----
-    The mesh uses:
-    - a core region that covers the data footprint,
-    - outward padding so boundary effects are reduced,
-    - vertical extent that reaches below expected target depths.
-    """
+    """TensorMesh: 500 m x/y core, 250 m z core, geometric padding, survey-aligned extent."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     if x.ndim != 1 or y.ndim != 1:
@@ -55,124 +40,159 @@ def build_mesh(
     if x.size < 2 or y.size < 2:
         raise ValueError("x and y must each contain at least 2 points.")
 
-    dx = float(core_cell_size)
-    dy = float(core_cell_size)
-    dz = float(core_cell_size)
+    x_min, x_max = float(x.min()), float(x.max())
+    y_min, y_max = float(y.min()), float(y.max())
+    x_span = x_max - x_min
+    y_span = y_max - y_min
+    x_center = 0.5 * (x_min + x_max)
+    y_center = 0.5 * (y_min + y_max)
 
-    x_span = float(x.max() - x.min())
-    y_span = float(y.max() - y.min())
+    dx0 = float(core_cell_size_xy)
+    dy0 = float(core_cell_size_xy)
+    dz_core = float(core_cell_size_z)
+    n_pad = int(padding_cells)
+    if n_pad < 1:
+        raise ValueError("padding_cells must be >= 1.")
 
-    # Number of core cells is chosen to at least cover the survey span.
-    n_core_x = max(4, int(np.ceil(x_span / dx)))
-    n_core_y = max(4, int(np.ceil(y_span / dy)))
-    n_core_z = max(12, int(np.ceil(max(x_span, y_span) / (2.0 * dz))))
+    n_core_z = max(1, int(np.ceil(float(depth_core_m) / dz_core)))
+    pad_z = _geometric_padding_widths(dz_core, n_pad, padding_factor)
+    hz = np.concatenate([pad_z[::-1], np.full(n_core_z, dz_core, dtype=float)])
 
-    # TensorMesh cell-size tuples: (cell_width, n_cells, expansion_factor).
-    # Negative factor means cells shrink toward the core from the outside.
-    hx = [(dx, padding_cells, -padding_factor), (dx, n_core_x), (dx, padding_cells, padding_factor)]
-    hy = [(dy, padding_cells, -padding_factor), (dy, n_core_y), (dy, padding_cells, padding_factor)]
-    hz = [(dz, padding_cells, -padding_factor), (dz, n_core_z), (dz, padding_cells, padding_factor)]
+    n_z_total = int(hz.size)
+    max_xy_block = max(1, int(max_total_cells // n_z_total))
 
-    mesh = discretize.TensorMesh([hx, hy, hz], x0="CCC")
+    dx, dy = dx0, dy0
+    n_core_x = max(1, int(np.ceil(x_span / dx)))
+    n_core_y = max(1, int(np.ceil(y_span / dy)))
+    while (n_core_x + 2 * n_pad) * (n_core_y + 2 * n_pad) > max_xy_block:
+        scale = np.sqrt(
+            ((n_core_x + 2 * n_pad) * (n_core_y + 2 * n_pad)) / float(max_xy_block)
+        )
+        dx *= scale * 1.01
+        dy *= scale * 1.01
+        n_core_x = max(1, int(np.ceil(x_span / dx)))
+        n_core_y = max(1, int(np.ceil(y_span / dy)))
 
-    x_center = 0.5 * (x.min() + x.max())
-    y_center = 0.5 * (y.min() + y.max())
+    if dx > dx0 * 1.001 or dy > dy0 * 1.001:
+        print(
+            f"Note: horizontal core cell size increased to dx={dx:.1f} m, dy={dy:.1f} m "
+            f"to keep total cells <= {max_total_cells}."
+        )
 
-    # Shift mesh so its center aligns with the survey center in x/y.
-    mesh.origin = np.r_[
-        x_center - 0.5 * mesh.h[0].sum(),
-        y_center - 0.5 * mesh.h[1].sum(),
-        -mesh.h[2].sum(),  # top of mesh near z=0
-    ]
+    pad_x = _geometric_padding_widths(dx, n_pad, padding_factor)
+    pad_y = _geometric_padding_widths(dy, n_pad, padding_factor)
+    hx = np.concatenate([pad_x[::-1], np.full(n_core_x, dx, dtype=float), pad_x])
+    hy = np.concatenate([pad_y[::-1], np.full(n_core_y, dy, dtype=float), pad_y])
+
+    mesh = discretize.TensorMesh([hx, hy, hz], x0=np.zeros(3))
+
+    core_width_x = n_core_x * dx
+    core_width_y = n_core_y * dy
+    x0_mesh = x_center - 0.5 * core_width_x - float(np.sum(pad_x))
+    y0_mesh = y_center - 0.5 * core_width_y - float(np.sum(pad_y))
+    z0_mesh = -float(np.sum(hz))
+    mesh.origin = np.array([x0_mesh, y0_mesh, z0_mesh], dtype=float)
+
+    hx_arr = np.asarray(mesh.h[0], dtype=float)
+    hy_arr = np.asarray(mesh.h[1], dtype=float)
+    hz_arr = np.asarray(mesh.h[2], dtype=float)
+    hx_min, hy_min, hz_min = float(hx_arr.min()), float(hy_arr.min()), float(hz_arr.min())
+    extent_x = float(np.sum(hx_arr))
+    extent_y = float(np.sum(hy_arr))
+    extent_z = float(np.sum(hz_arr))
+
+    print(
+        "Mesh shape (nCx, nCy, nCz):",
+        tuple(int(s) for s in mesh.shape_cells),
+        "| total cells:",
+        mesh.n_cells,
+    )
+    print(
+        f"Smallest cell widths — hx: {hx_min:.2f} m, hy: {hy_min:.2f} m, hz: {hz_min:.2f} m "
+        f"(global min: {min(hx_min, hy_min, hz_min):.2f} m)"
+    )
+    print(
+        f"Mesh extent — x: {extent_x:.1f} m, y: {extent_y:.1f} m, z: {extent_z:.1f} m "
+        f"(survey span x: {x_span:.1f} m, y: {y_span:.1f} m)"
+    )
     return mesh
 
 
-def build_survey(obs_file_path: str | Path) -> magnetics.survey.Survey:
-    """Build a SimPEG magnetic survey from exported observation arrays.
+def build_magnetic_survey(receiver_locations: np.ndarray) -> magnetics.survey.Survey:
+    """Tutorial-style survey: ``Point`` receivers + ``UniformBackgroundField`` + ``Survey``.
 
-    Parameters
-    ----------
-    obs_file_path : str | Path
-        Path to the `.npz` produced by `export_simpeg_obs`.
-
-    Returns
-    -------
-    simpeg.potential_fields.magnetics.survey.Survey
-        Survey object containing receiver locations and source field.
-
-    Notes
-    -----
-    The inducing field is set for Red Lake:
-    - inclination = 77 degrees
-    - declination = 0 degrees
-    - strength = 57,000 nT
+    Inducing field: 57,000 nT, I=77°, D=0° (northern Canada / Red Lake style).
     """
-    obs_file_path = Path(obs_file_path)
-    if not obs_file_path.exists():
-        raise FileNotFoundError(f"Observation file not found: {obs_file_path}")
-
-    obs = np.load(obs_file_path)
-    rx_locs = np.asarray(obs["receiver_locations"], dtype=float)
-    if rx_locs.ndim != 2 or rx_locs.shape[1] != 3:
+    rx = np.asarray(receiver_locations, dtype=float)
+    if rx.ndim != 2 or rx.shape[1] != 3:
         raise ValueError("receiver_locations must have shape (N, 3).")
 
-    # Receivers define where magnetic data are measured.
-    receivers = magnetics.receivers.Point(rx_locs, components=["tmi"])
-
-    # SourceField stores the Earth's inducing magnetic field parameters.
+    receivers = magnetics.receivers.Point(rx, components=["tmi"])
     source_field = magnetics.sources.UniformBackgroundField(
         receiver_list=[receivers],
         amplitude=57000.0,
         inclination=77.0,
         declination=0.0,
     )
+    return magnetics.survey.Survey(source_field)
 
-    # Survey combines source + receivers into the measurement geometry.
-    survey = magnetics.survey.Survey(source_field)
-    return survey
+
+def build_survey(obs_file_path: str | Path) -> magnetics.survey.Survey:
+    """Load ``receiver_locations`` from a ``.npz`` (e.g. ``export_simpeg_obs``) and build the survey."""
+    obs_file_path = Path(obs_file_path)
+    if not obs_file_path.exists():
+        raise FileNotFoundError(f"Observation file not found: {obs_file_path}")
+
+    obs = np.load(obs_file_path)
+    rx_locs = np.asarray(obs["receiver_locations"], dtype=float)
+    return build_magnetic_survey(rx_locs)
 
 
 def build_simulation(
     mesh: discretize.TensorMesh,
     survey: magnetics.survey.Survey,
-    actind: np.ndarray,
+    actind: np.ndarray | None = None,
+    store_sensitivities: str = "ram",
+    sensitivity_path: str | Path | None = None,
+    sensitivity_dtype: np.dtype | str | None = None,
 ) -> magnetics.simulation.Simulation3DIntegral:
-    """Build a 3D integral magnetic forward simulation.
+    """``Simulation3DIntegral`` with ``IdentityMap`` when all cells are active (tutorial default).
 
     Parameters
     ----------
-    mesh : discretize.TensorMesh
-        Inversion mesh.
-    survey : simpeg.potential_fields.magnetics.survey.Survey
-        Magnetic survey object.
-    actind : np.ndarray
-        Boolean mask of active cells (True = cell is included in model).
-
-    Returns
-    -------
-    simpeg.potential_fields.magnetics.simulation.Simulation3DIntegral
-        Simulation object that predicts magnetic data from susceptibility.
-
-    Notes
-    -----
-    `Simulation3DIntegral` computes TMI responses of each active cell and
-    assembles them into the linear forward operator used during inversion.
+    actind : np.ndarray | None
+        Active cells; default all ``True``.
+    store_sensitivities : str, default ``"ram"``
+        Use ``"forward_only"`` for forward-only ``dpred`` (faster, no stored sensitivities).
+        Use ``"ram"`` or ``"disk"`` for inversion. Large meshes should use ``"disk"`` to
+        avoid exhausting RAM.
+    sensitivity_path : str | Path | None
+        Directory for sensitivity blocks when ``store_sensitivities="disk"``. SimPEG default
+        is ``./sensitivities``; pass an absolute path if the working directory may vary.
+    sensitivity_dtype : np.dtype | str | None
+        Optional sensitivity dtype passed to SimPEG (e.g. ``np.float32``) to reduce disk usage.
     """
-    actind = np.asarray(actind)
-    if actind.dtype != bool:
-        actind = actind.astype(bool)
+    if actind is None:
+        actind = np.ones(mesh.n_cells, dtype=bool)
+    actind = np.asarray(actind, dtype=bool)
     if actind.size != mesh.n_cells:
         raise ValueError("actind must have length mesh.n_cells.")
 
-    # Maps inversion model (active cells only) -> full mesh susceptibility.
-    model_map = maps.InjectActiveCells(mesh, actind, valInactive=0.0)
+    if bool(np.all(actind)):
+        chi_map = maps.IdentityMap(mesh)
+    else:
+        chi_map = maps.InjectActiveCells(mesh, actind, value_inactive=0.0)
 
-    simulation = magnetics.simulation.Simulation3DIntegral(
+    kwargs: dict = dict(
         survey=survey,
-        mesh=mesh,
-        chiMap=model_map,
+        chiMap=chi_map,
         active_cells=actind,
-        store_sensitivities="ram",
+        store_sensitivities=store_sensitivities,
         engine="geoana",
     )
-    return simulation
+    if store_sensitivities == "disk" and sensitivity_path is not None:
+        kwargs["sensitivity_path"] = str(Path(sensitivity_path))
+    if sensitivity_dtype is not None:
+        kwargs["sensitivity_dtype"] = sensitivity_dtype
+
+    return magnetics.simulation.Simulation3DIntegral(mesh, **kwargs)

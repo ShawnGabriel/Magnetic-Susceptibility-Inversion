@@ -1,43 +1,9 @@
-"""Prospectivity mapping utilities based on recovered susceptibility models."""
+"""Prospectivity mapping from recovered magnetic susceptibility models (no external GIS required)."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
-from shapely.geometry import box
-
-
-def load_bedrock_geology(shapefile_path: str | Path, study_bbox: tuple[float, float, float, float]) -> gpd.GeoDataFrame:
-    """Load and clip bedrock geology polygons to a study area bounding box.
-
-    Parameters
-    ----------
-    shapefile_path : str | Path
-        Path to OGS bedrock geology shapefile.
-    study_bbox : tuple[float, float, float, float]
-        Bounding box as `(minx, miny, maxx, maxy)` in the same CRS as the shapefile.
-
-    Returns
-    -------
-    geopandas.GeoDataFrame
-        Clipped bedrock geology GeoDataFrame.
-    """
-    shapefile_path = Path(shapefile_path)
-    if not shapefile_path.exists():
-        raise FileNotFoundError(f"Shapefile not found: {shapefile_path}")
-
-    gdf = gpd.read_file(shapefile_path)
-    if gdf.empty:
-        raise ValueError(f"No features found in shapefile: {shapefile_path}")
-
-    minx, miny, maxx, maxy = study_bbox
-    clip_geom = box(minx, miny, maxx, maxy)
-    clip_gdf = gpd.GeoDataFrame({"geometry": [clip_geom]}, crs=gdf.crs)
-    gdf_clip = gpd.clip(gdf, clip_gdf)
-    return gdf_clip
 
 
 def depth_integrated_susceptibility(
@@ -58,12 +24,12 @@ def depth_integrated_susceptibility(
     actind : np.ndarray
         Boolean active-cell mask.
     z_min, z_max : float
-        Depth interval (m, positive down). Example: `0, 500`.
+        Depth interval (m, positive down). Example: ``0, 500``.
 
     Returns
     -------
     susc_map : np.ndarray
-        2D depth-integrated susceptibility map with shape `(nCx, nCy)`.
+        2D depth-integrated susceptibility map with shape ``(nCx, nCy)``.
     x : np.ndarray
         Mesh cell-center x coordinates.
     y : np.ndarray
@@ -81,7 +47,6 @@ def depth_integrated_susceptibility(
     z_cc = np.asarray(mesh.cell_centers_z)
     hz = np.asarray(mesh.h[2])
 
-    # Convert requested depth range (positive down) to z coordinates (negative down).
     z_top = -abs(float(z_min))
     z_bottom = -abs(float(z_max))
     z_hi = max(z_top, z_bottom)
@@ -91,7 +56,6 @@ def depth_integrated_susceptibility(
     if not np.any(z_mask):
         raise ValueError("Requested depth window does not intersect mesh z coordinates.")
 
-    # Weighted depth integration: sum susceptibility * layer thickness.
     model_sub = model_3d[:, :, z_mask]
     dz_sub = hz[z_mask]
     susc_map = np.sum(model_sub * dz_sub[np.newaxis, np.newaxis, :], axis=2)
@@ -107,12 +71,7 @@ def prospectivity_score(
     y: np.ndarray,
     low_susc_threshold: float = 0.001,
 ) -> np.ndarray:
-    """Compute prospectivity score from low susceptibility and boundary gradients.
-
-    Scoring logic:
-    - Lower susceptibility (below threshold) is favorable.
-    - Strong susceptibility gradients (proxy for geological contacts) are favorable.
-    - Final score is normalized to [0, 1].
+    """Score cells: low susceptibility plus high-gradient boundaries → higher prospectivity.
 
     Parameters
     ----------
@@ -126,16 +85,14 @@ def prospectivity_score(
     Returns
     -------
     np.ndarray
-        Prospectivity score map in range [0, 1].
+        Prospectivity score map in range ``[0, 1]``.
     """
     susc_map = np.asarray(susc_map, dtype=float)
     if susc_map.shape != (len(x), len(y)):
         raise ValueError("susc_map shape must be (len(x), len(y)).")
 
-    # Normalize low susceptibility favorability: 1 means very low susceptibility.
     low_component = np.clip((low_susc_threshold - susc_map) / max(low_susc_threshold, 1e-12), 0.0, 1.0)
 
-    # Compute gradient magnitude as a contact/boundary proxy.
     dx = float(np.nanmedian(np.diff(np.asarray(x, dtype=float)))) if len(x) > 1 else 1.0
     dy = float(np.nanmedian(np.diff(np.asarray(y, dtype=float)))) if len(y) > 1 else 1.0
     gx, gy = np.gradient(susc_map, dx, dy, edge_order=1)
@@ -148,7 +105,6 @@ def prospectivity_score(
     else:
         grad_component = (grad_mag - gmin) / (gmax - gmin)
 
-    # Weighted combination emphasizing both low susceptibility and boundaries.
     score = 0.6 * low_component + 0.4 * grad_component
     score = np.clip(score, 0.0, 1.0)
     return score
@@ -161,16 +117,16 @@ def plot_prospectivity(
     deposit_points: list[tuple[float, float]] | None = None,
     title: str = "",
 ) -> None:
-    """Plot a prospectivity map and optional known deposit locations.
+    """Plot a prospectivity map and optional validation points.
 
     Parameters
     ----------
     score_map : np.ndarray
-        2D prospectivity scores in [0, 1] with shape `(len(x), len(y))`.
+        2D prospectivity scores in ``[0, 1]`` with shape ``(len(x), len(y))``.
     x, y : np.ndarray
         1D map coordinates.
     deposit_points : list[tuple[float, float]] | None
-        Optional known deposit points as `(x, y)` tuples.
+        Optional points as ``(x, y)`` in the same units as the map.
     title : str, default=""
         Figure title.
     """
@@ -189,7 +145,7 @@ def plot_prospectivity(
         vmax=1.0,
     )
     cb = plt.colorbar(im, ax=ax)
-    cb.set_label("Prospectivity Score (0-1)")
+    cb.set_label("Prospectivity score (0–1)")
 
     if deposit_points:
         pts = np.asarray(deposit_points, dtype=float)
@@ -201,11 +157,11 @@ def plot_prospectivity(
             c="cyan",
             edgecolors="black",
             linewidths=0.8,
-            label="Known Gold Zones",
+            label="Validation points",
         )
         ax.legend(loc="best")
 
-    ax.set_title(title if title else "Gold Prospectivity Map")
-    ax.set_xlabel("Easting / Longitude")
-    ax.set_ylabel("Northing / Latitude")
+    ax.set_title(title if title else "Prospectivity map")
+    ax.set_xlabel("Easting (m)")
+    ax.set_ylabel("Northing (m)")
     plt.show()

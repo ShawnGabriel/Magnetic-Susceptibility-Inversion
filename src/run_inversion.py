@@ -89,23 +89,25 @@ def run_smooth_inversion(
 
     # ProjectedGNCG handles bound-constrained Gauss-Newton-CG optimization.
     opt = optimization.ProjectedGNCG(
-        maxIter=20,       # max outer inversion iterations
+        maxIter=12,       # max outer inversion iterations (laptop-safe)
         lower=0.0,        # susceptibility cannot be negative in this setup
         upper=1.0,        # conservative physical upper bound
-        maxIterCG=30,     # max CG steps per GN update
+        maxIterCG=15,     # max CG steps per GN update
         tolCG=1e-3,       # CG convergence tolerance
     )
 
     # Combines misfit + regularization into one objective.
     inv_prob = inverse_problem.BaseInvProblem(dmis, reg, opt)
 
-    # Beta controls tradeoff between fitting data (phi_d) and smoothness (phi_m).
-    beta_est = directives.BetaEstimate_ByEig(beta0_ratio=1.0)
-    beta_sched = directives.BetaSchedule(coolingFactor=2.0, coolingRate=1)
+    # Manual initial beta avoids BetaEstimate_ByEig (heavy eigenvalue solve) on large meshes.
+    phi_d0 = float(inv_prob.dmisfit(m0))
+    phi_m0 = float(inv_prob.reg(m0))
+    inv_prob.beta = phi_d0 / max(phi_m0, 1e-30)
+
     target = directives.TargetMisfit(chifact=1.0)
     save_dir = _save_iterations_directive(folder="smooth_iterations")
 
-    directive_list = [beta_est, beta_sched, target]
+    directive_list = [beta_sched, target]
     if save_dir is not None:
         directive_list.append(save_dir)
 
@@ -161,39 +163,51 @@ def run_sparse_inversion(
 
     # Sparse regularization for sharper geological boundaries.
     reg = regularization.Sparse(mesh, active_cells=actind)
-    reg.norms = np.c_[p_s, p_x, p_y, p_z]
+    # SimPEG expects one norm value per regularization function (smallness, x, y, z).
+    reg.norms = [p_s, p_x, p_y, p_z]
     reg.alpha_s = 1.0
     reg.alpha_x = 1.0
     reg.alpha_y = 1.0
     reg.alpha_z = 1.0
 
     opt = optimization.ProjectedGNCG(
-        maxIter=25,       # allow extra iterations for IRLS updates
+        maxIter=12,       # laptop-safe outer iterations for IRLS
         lower=0.0,
         upper=1.0,
-        maxIterCG=30,
+        maxIterCG=15,
         tolCG=1e-3,
     )
 
     inv_prob = inverse_problem.BaseInvProblem(dmis, reg, opt)
 
-    beta_est = directives.BetaEstimate_ByEig(beta0_ratio=1.0)
+    phi_d0 = float(inv_prob.dmisfit(m0))
+    phi_m0 = float(inv_prob.reg(m0))
+    inv_prob.beta = phi_d0 / max(phi_m0, 1e-30)
+
     beta_sched = directives.BetaSchedule(coolingFactor=2.0, coolingRate=1)
     target = directives.TargetMisfit(chifact=1.0)
 
     # IRLS updates model weights to approximate sparse norms each iteration.
-    if hasattr(directives, "Update_IRLS"):
+    if hasattr(directives, "UpdateIRLS"):
+        irls = directives.UpdateIRLS(
+            f_min_change=1e-4,
+            max_irls_iterations=8,
+            irls_cooling_factor=1.5,
+        )
+    elif hasattr(directives, "Update_IRLS"):
         irls = directives.Update_IRLS(
-            f_min_change=1e-4, max_irls_iterations=20, coolEpsFact=1.5
+            f_min_change=1e-4, max_irls_iterations=8, coolEpsFact=1.5
         )
     else:
         irls = None
 
     save_dir = _save_iterations_directive(folder="sparse_iterations")
 
-    directive_list = [beta_est, beta_sched, target]
+    directive_list = [target]
     if irls is not None:
         directive_list.append(irls)
+    else:
+        directive_list.insert(0, directives.BetaSchedule(coolingFactor=2.0, coolingRate=1))
     if save_dir is not None:
         directive_list.append(save_dir)
 

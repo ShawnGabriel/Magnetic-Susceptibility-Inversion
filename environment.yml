@@ -8,9 +8,6 @@ dependencies:
   - scipy
   - pandas
   - matplotlib
-  - geopandas
-  - rasterio
-  - shapely
   - jupyter
   - ipykernel
   - scikit-learn
